@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LorHels Office</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.25/jspdf.plugin.autotable.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js";
+
+        // --- Configuración Firebase ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyCYJ6gvZ_SCr-tJogKKkvwOItP-jlMrc0I",
+            authDomain: "lorhels-office.firebaseapp.com",
+            projectId: "lorhels-office",
+            storageBucket: "lorhels-office.firebasestorage.app",
+            messagingSenderId: "68000083759",
+            appId: "1:68000083759:web:69e758283390be44d23bda"
+        };
+
+        const appId = "lorhels-office"; 
+
+        let auth, db, stockChart = null;
+
+        let state = {
+            user: null,
+            view: 'employee', 
+            adminTab: 'inventory',
+            analyticsMode: 'stock',
+            isAdminAuthenticated: false,
+            inventory: [],
+            requests: [],
+            cart: [],
+            employeeName: '',
+            department: '',
+            searchQuery: '',
+            selectedCategory: 'Todos',
+            isLoading: true,
+            isSubmitting: false,
+            editingProduct: null,
+            returningRequest: null, // NUEVO: Guarda el ticket que se está devolviendo
+            listenersActive: false
+        };
+
+        const generateRequestPDF = (data) => {
+            const { jsPDF } = window.jspdf;
+            const doc = new jsPDF();
+            doc.setFillColor(37, 99, 235);
+            doc.rect(0, 0, 210, 40, 'F');
+            doc.setTextColor(255, 255, 255);
+            doc.setFontSize(22);
+            doc.setFont("helvetica", "bold");
+            doc.text("Ofi-Heinsen", 20, 25);
+            doc.setFontSize(10);
+            doc.text("COMPROBANTE DE SOLICITUD DE INSUMOS", 20, 32);
+            doc.setTextColor(50, 50, 50);
+            doc.setFontSize(12);
+            doc.setFont("helvetica", "bold");
+            doc.text("Detalles del Solicitante", 20, 55);
+            doc.setFont("helvetica", "normal");
+            doc.setFontSize(10);
+            doc.text(`Solicitante: ${data.employee}`, 20, 65);
+            doc.text(`Departamento: ${data.department}`, 20, 72);
+            doc.text(`Fecha: ${data.date}`, 20, 79);
+            doc.text(`ID Transacción: ${Math.random().toString(36).substr(2, 9).toUpperCase()}`, 20, 86);
+            const tableBody = data.items.map(item => [item.name, item.quantity, item.unit || 'uds']);
+            doc.autoTable({ startY: 95, head: [['Descripción del Insumo', 'Cantidad', 'Unidad']], body: tableBody, headStyles: { fillColor: [37, 99, 235], fontStyle: 'bold' }, alternateRowStyles: { fillColor: [245, 247, 250] }, margin: { left: 20, right: 20 } });
+            const finalY = doc.lastAutoTable.finalY + 30;
+            doc.setDrawColor(200, 200, 200);
+            doc.line(20, finalY, 80, finalY);
+            doc.line(130, finalY, 190, finalY);
+            doc.setFontSize(8);
+            doc.text("Firma Solicitante", 35, finalY + 5);
+            doc.text("Firma Despacho", 145, finalY + 5);
+            doc.save(`Solicitud_${data.employee.replace(/\s+/g, '_')}_${Date.now()}.pdf`);
+        };
+
+        const notify = (message, type = 'success') => {
+            const toast = document.getElementById('notification');
+            if (!toast) return;
+            toast.textContent = message;
+            toast.className = `fixed bottom-12 right-12 z-[60] flex items-center gap-5 px-10 py-6 rounded-[2.5rem] shadow-2xl transition-all duration-300 text-white font-black ${type === 'error' ? 'bg-red-500 shadow-red-100' : 'bg-slate-900 border border-slate-800 shadow-slate-200'}`;
+            toast.classList.remove('hidden', 'opacity-0', 'translate-y-10');
+            setTimeout(() => { toast.classList.add('opacity-0', 'translate-y-10'); setTimeout(() => toast.classList.add('hidden'), 300); }, 3000);
+        };
+
+        const addToCart = (productId) => {
+            const item = state.inventory.find(i => i.id === productId);
+            if (!item || item.stock <= 0) return notify("Sin stock disponible", "error");
+            const existing = state.cart.find(c => c.id === productId);
+            if (existing) { if (existing.quantity < item.stock) existing.quantity++; else notify("Límite de stock alcanzado", "error"); } else { state.cart.push({ ...item, quantity: 1, returned: 0 }); }
+            render();
+        };
+
+        const updateCartQuantity = (productId, delta) => {
+            const item = state.cart.find(c => c.id === productId);
+            const invItem = state.inventory.find(i => i.id === productId);
+            if (item) {
+                const newQty = item.quantity + delta;
+                if (newQty > 0 && newQty <= invItem.stock) item.quantity = newQty;
+                else if (newQty <= 0) state.cart = state.cart.filter(c => c.id !== productId);
+            }
+            render();
+        };
+
+        const submitRequest = async () => {
+            if (!state.user) return notify("Error de sesión", "error");
+            const name = document.getElementById('employeeName').value;
+            const dept = document.getElementById('departmentSelect').value;
+            if (!name || !dept || state.cart.length === 0) return notify("Faltan datos obligatorios", "error");
+            state.isSubmitting = true; render();
+            try {
+                const requestData = { docType: 'request', timestamp: Date.now(), date: new Date().toLocaleString(), employee: name, department: dept, items: state.cart.map(i => ({ id: i.id, name: i.name, quantity: i.quantity, unit: i.unit, returned: 0 })), status: 'Pendiente', userId: state.user.uid };
+                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'tickets'), requestData);
+                for (const cartItem of state.cart) {
+                    const itemRef = doc(db, 'artifacts', appId, 'public', 'data', 'tickets', cartItem.id);
+                    const currentInv = state.inventory.find(i => i.id === cartItem.id);
+                    if (currentInv) await updateDoc(itemRef, { stock: Math.max(0, currentInv.stock - cartItem.quantity) });
+                }
+                generateRequestPDF(requestData);
+                state.cart = []; state.employeeName = ""; state.department = "";
+                notify("Solicitud procesada y PDF generado");
+            } catch (e) { notify("Error al procesar", "error"); } finally { state.isSubmitting = false; render(); }
+        };
+
+        const handleSaveProduct = async (e) => {
+            e.preventDefault(); const form = e.target;
+            const productData = { docType: 'inventory', name: form.name.value, category: form.category.value, stock: parseInt(form.stock.value), minStock: parseInt(form.minStock.value), unit: form.unit.value };
+            try {
+                const ticketsCol = collection(db, 'artifacts', appId, 'public', 'data', 'tickets');
+                if (state.editingProduct) await setDoc(doc(ticketsCol, state.editingProduct.id), productData, { merge: true });
+                else await addDoc(ticketsCol, productData);
+                closeModal(); notify("Inventario sincronizado");
+            } catch (e) { notify("Error de permisos", "error"); }
+        };
+
+        const initChart = () => {
+            const ctx = document.getElementById('stockChartCanvas')?.getContext('2d');
+            if (!ctx) return;
+            if (stockChart) stockChart.destroy();
+            let chartData = { labels: [], datasets: [] };
+            if (state.analyticsMode === 'stock') {
+                chartData.labels = state.inventory.map(i => i.name);
+                chartData.datasets = [{ label: 'Stock Actual', data: state.inventory.map(i => i.stock), backgroundColor: state.inventory.map(i => i.stock <= (i.minStock || 0) ? 'rgba(239, 68, 68, 0.8)' : 'rgba(59, 130, 246, 0.8)'), borderRadius: 8 }];
+            } else if (state.analyticsMode === 'department') {
+                const deptStats = {};
+                state.requests.forEach(req => { const dept = req.department || 'Sin Depto'; const totalQty = req.items.reduce((sum, item) => sum + (item.quantity || 0), 0); deptStats[dept] = (deptStats[dept] || 0) + totalQty; });
+                chartData.labels = Object.keys(deptStats);
+                chartData.datasets = [{ label: 'Items Consumidos', data: Object.values(deptStats), backgroundColor: 'rgba(139, 92, 246, 0.8)', borderRadius: 8 }];
+            }
+            stockChart = new Chart(ctx, { type: 'bar', data: chartData, options: { responsive: true, maintainAspectRatio: false } });
+        };
+
+        const render = () => {
+            const root = document.getElementById('app-content');
+            if (!root) return;
+            const activeElementId = document.activeElement ? document.activeElement.id : null;
+            const btnEmp = document.getElementById('nav-btn-emp');
+            const btnAdm = document.getElementById('nav-btn-adm');
+            
+            if (btnEmp && btnAdm) {
+                if (state.view === 'employee') {
+                    btnEmp.className = "px-6 py-2 rounded-xl text-xs font-black uppercase tracking-widest transition-all bg-white shadow-sm text-blue-600";
+                    btnAdm.className = "px-6 py-2 rounded-xl text-xs font-black uppercase tracking-widest transition-all text-slate-400 hover:text-slate-600";
+                } else {
+                    btnEmp.className = "px-6 py-2 rounded-xl text-xs font-black uppercase tracking-widest transition-all text-slate-400 hover:text-slate-600";
+                    btnAdm.className = "px-6 py-2 rounded-xl text-xs font-black uppercase tracking-widest transition-all bg-white shadow-sm text-indigo-600";
+                }
+            }
+
+            if (state.isLoading) root.innerHTML = `<div class="h-96 flex flex-col items-center justify-center gap-4 text-slate-300"><i data-lucide="loader-2" class="animate-spin w-12 h-12 text-blue-500"></i><p class="font-black uppercase tracking-widest text-xs">Sincronizando...</p></div>`;
+            else if (state.view === 'employee') renderEmployeeView(root);
+            else renderAdminView(root);
+            
+            lucide.createIcons();
+            if (state.view === 'admin' && state.adminTab === 'analytics') initChart();
+
+            if (activeElementId) {
+                const el = document.getElementById(activeElementId);
+                if (el) { el.focus(); if (el.value) { const val = el.value; el.value = ''; el.value = val; } }
+            }
+        };
+
+        const renderEmployeeView = (container) => {
+            const categories = ['Todos', ...new Set(state.inventory.map(item => item.category))];
+            const filteredInventory = state.inventory.filter(item => {
+                const matchesSearch = item.name.toLowerCase().includes(state.searchQuery) || item.category.toLowerCase().includes(state.searchQuery);
+                const matchesCategory = state.selectedCategory === 'Todos' || item.category === state.selectedCategory;
+                return matchesSearch && matchesCategory;
+            });
+
+            container.innerHTML = `
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 animate-in">
+                    <div class="lg:col-span-2 space-y-6">
+                        <header>
+                            <h1 class="text-4xl font-black text-slate-800 tracking-tighter">Seleccione Insumos</h1>
+                            <p class="text-slate-500 mt-2 font-medium italic mb-6">Seleccione los artículos necesarios</p>
+                        </header>
+
+                        <div class="flex flex-col md:flex-row gap-4 mb-8">
+                            <div class="flex-1 relative">
+                                <i data-lucide="search" class="absolute left-5 top-1/2 -translate-y-1/2 text-slate-400 w-5 h-5"></i>
+                                <input id="searchInput" type="text" placeholder="Buscar insumos..." oninput="window.setSearchQuery(this.value)" value="${state.searchQuery}" class="w-full pl-14 pr-4 py-4 bg-white border border-slate-200 rounded-2xl outline-none focus:ring-4 focus:ring-blue-50 font-bold shadow-sm text-slate-700 placeholder-slate-400 transition-all" />
+                            </div>
+                            <div class="flex gap-2 overflow-x-auto custom-scrollbar pb-2 md:pb-0 items-center">
+                                ${categories.map(cat => `
+                                    <button onclick="window.setSelectedCategory('${cat}')" class="whitespace-nowrap px-6 py-4 rounded-2xl text-xs font-black uppercase tracking-widest transition-all ${state.selectedCategory === cat ? 'bg-slate-800 text-white shadow-xl shadow-slate-200' : 'bg-white text-slate-500 hover:bg-slate-100 border border-slate-200'}">
+                                        ${cat}
+                                    </button>
+                                `).join('')}
+                            </div>
+                        </div>
+
+                        ${filteredInventory.length === 0 ? `
+                            <div class="bg-white rounded-[2.5rem] border border-slate-200 p-12 text-center shadow-sm">
+                                <div class="w-20 h-20 bg-slate-50 text-slate-300 rounded-[2rem] flex items-center justify-center mx-auto mb-6"><i data-lucide="package-x" class="w-10 h-10"></i></div>
+                                <h3 class="font-black text-xl text-slate-800">No hay resultados</h3>
+                                <p class="text-slate-400 font-medium mt-2">Intenta con otra palabra clave o categoría.</p>
+                            </div>
+                        ` : `
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                ${filteredInventory.map(item => `
+                                    <div class="bg-white p-6 rounded-[2rem] border border-slate-200 shadow-sm hover:shadow-xl transition-all group active:scale-[0.98]">
+                                        <div class="flex justify-between items-start mb-6">
+                                            <div class="flex-1">
+                                                <h3 class="font-bold text-slate-800 text-lg leading-tight group-hover:text-blue-600 transition-colors">${item.name}</h3>
+                                                <p class="text-[10px] text-slate-400 uppercase font-black mt-1 tracking-wider">${item.category}</p>
+                                            </div>
+                                            <div class="px-3 py-1 text-[10px] font-black uppercase rounded-full ${item.stock <= (item.minStock || 0) ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-600'}">
+                                                Stock: ${item.stock}
+                                            </div>
+                                        </div>
+                                        <button onclick="window.addToCart('${item.id}')" ${item.stock <= 0 ? 'disabled' : ''} class="w-full bg-blue-600 text-white py-3.5 rounded-2xl font-black hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-400 flex items-center justify-center gap-2 transition-all shadow-lg shadow-blue-100">
+                                            <i data-lucide="plus" class="w-5 h-5"></i> Añadir
+                                        </button>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        `}
+                    </div>
+
+                    <div class="bg-white p-8 rounded-[2.5rem] border border-slate-200 h-fit sticky top-24 shadow-2xl border-t-[12px] border-t-blue-600">
+                        <h2 class="text-2xl font-black mb-8 flex items-center gap-3 tracking-tighter"><i data-lucide="shopping-cart" class="text-blue-600"></i>Listado</h2>
+                        <div class="space-y-4 mb-8">
+                            <input id="employeeName" value="${state.employeeName}" oninput="window.state.employeeName = this.value" placeholder="Solicitante" class="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:ring-4 focus:ring-blue-50 font-bold" />
+                            <select id="departmentSelect" onchange="window.state.department = this.value" class="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:ring-4 focus:ring-blue-50 font-bold">
+                                <option value="">Departamento...</option>
+                                ${['Administración', 'Almacén', 'Cobros', 'Contabilidad', 'Operaciones', 'Recepción', 'Tecnología', 'Trafico', 'Ventas'].map(d => `<option value="${d}" ${state.department === d ? 'selected' : ''}>${d}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div class="divide-y divide-slate-100 max-h-72 overflow-y-auto pr-2 custom-scrollbar">
+                            ${state.cart.length === 0 ? '<p class="text-center py-10 text-slate-300 font-bold text-xs tracking-widest uppercase italic">Seleccionado</p>' : state.cart.map(item => `
+                                <div class="py-5 flex justify-between items-center">
+                                    <div class="flex-1">
+                                        <p class="font-black text-slate-800 text-sm leading-tight">${item.name}</p>
+                                        <div class="flex items-center gap-4 mt-3">
+                                            <button onclick="window.updateCartQuantity('${item.id}', -1)" class="w-8 h-8 rounded-xl bg-slate-100 hover:bg-slate-200 flex items-center justify-center transition-all shadow-sm active:scale-90"><i data-lucide="minus" class="w-3.5 h-3.5"></i></button>
+                                            <span class="font-black text-blue-600 text-lg">${item.quantity}</span>
+                                            <button onclick="window.updateCartQuantity('${item.id}', 1)" class="w-8 h-8 rounded-xl bg-slate-100 hover:bg-slate-200 flex items-center justify-center transition-all shadow-sm active:scale-90"><i data-lucide="plus" class="w-3.5 h-3.5"></i></button>
+                                        </div>
+                                    </div>
+                                    <button onclick="window.updateCartQuantity('${item.id}', -${item.quantity})" class="text-red-300 hover:text-red-500 p-2 transition-all"><i data-lucide="trash-2" class="w-5 h-5"></i></button>
+                                </div>
+                            `).join('')}
+                        </div>
+                        ${state.cart.length > 0 ? `
+                            <button onclick="window.submitRequest()" ${state.isSubmitting ? 'disabled' : ''} class="w-full mt-10 bg-green-600 text-white py-5 rounded-3xl font-black hover:bg-green-700 shadow-xl flex flex-col items-center justify-center gap-1 active:scale-95 transition-all">
+                                <div class="flex items-center gap-2">
+                                    ${state.isSubmitting ? '<i data-lucide="loader-2" class="animate-spin w-6 h-6"></i>' : '<i data-lucide="file-text" class="w-6 h-6"></i>'}
+                                    <span class="text-lg">Procesar y PDF</span>
+                                </div>
+                                <span class="text-[10px] opacity-70 uppercase tracking-widest">Descarga automática</span>
+                            </button>
+                        ` : ''}
+                    </div>
+                </div>
+            `;
+        };
+
+        const renderAdminView = (root) => {
+            if (!state.isAdminAuthenticated) {
+                root.innerHTML = `
+                    <div class="max-w-md mx-auto mt-20 bg-white p-12 rounded-[3.5rem] border border-slate-200 shadow-2xl text-center">
+                        <div class="w-24 h-24 bg-indigo-50 text-indigo-600 rounded-[2.5rem] flex items-center justify-center mx-auto mb-10 shadow-inner"><i data-lucide="shield-check" class="w-12 h-12"></i></div>
+                        <h2 class="text-3xl font-black mb-8 tracking-tighter text-slate-800">Panel Maestro</h2>
+                        <form id="adminLoginForm" onsubmit="window.handleAdminLogin(event)" class="space-y-6">
+                            <input type="email" id="adminEmail" required class="w-full p-5 bg-slate-50 border-2 border-slate-100 rounded-3xl outline-none focus:border-indigo-500 text-center text-xl font-bold" placeholder="admin@empresa.com" />
+                            <input type="password" id="adminPwd" required class="w-full p-5 bg-slate-50 border-2 border-slate-100 rounded-3xl outline-none focus:border-indigo-500 text-center text-3xl font-bold tracking-[0.5em]" placeholder="••••" />
+                            <button type="submit" id="adminLoginBtn" class="w-full bg-indigo-600 text-white py-5 rounded-[2rem] font-black hover:bg-indigo-700 shadow-2xl text-lg transition-all flex justify-center items-center gap-2">Ingresar</button>
+                        </form>
+                    </div>
+                `;
+                return;
+            }
+
+            root.innerHTML = `
+                <div class="space-y-8 animate-in">
+                    <header class="flex flex-wrap justify-between items-end gap-6 border-b border-slate-200 pb-8">
+                        <div><h1 class="text-4xl font-black tracking-tighter text-slate-800 uppercase">Gestión</h1><p class="text-slate-400 font-medium mt-1">Panel de control de inventario</p></div>
+                        <div class="flex gap-4">
+                            <div class="flex bg-slate-100 p-1.5 rounded-2xl border border-slate-200 shadow-inner">
+                                <button onclick="window.setAdminTab('inventory')" class="px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest ${state.adminTab === 'inventory' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-400'}">Inventario</button>
+                                <button onclick="window.setAdminTab('requests')" class="px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest ${state.adminTab === 'requests' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-400'}">Solicitudes</button>
+                                <button onclick="window.setAdminTab('analytics')" class="px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest ${state.adminTab === 'analytics' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-400'}">Analitica</button>
+                            </div>
+                            <button onclick="window.handleAdminLogout()" class="text-red-400 px-4 py-2 hover:bg-red-50 rounded-xl transition-all"><i data-lucide="log-out" class="w-6 h-6"></i></button>
+                        </div>
+                    </header>
+
+                    ${state.adminTab === 'inventory' ? `
+                        <div class="space-y-6">
+                            <div class="flex flex-col sm:flex-row justify-between items-center px-4 gap-4">
+                                <h2 class="text-2xl font-black flex items-center gap-3 tracking-tighter w-full sm:w-auto"><i data-lucide="layers" class="text-indigo-500"></i>Catálogo Insumos</h2>
+                                <div class="flex gap-2 w-full sm:w-auto overflow-x-auto pb-2 sm:pb-0">
+                                    <input type="file" id="excelUpload" accept=".xlsx, .xls" class="hidden" onchange="window.handleImportExcel(event)">
+                                    <button onclick="window.triggerImport()" class="bg-slate-100 text-slate-600 px-5 py-3 rounded-2xl font-black hover:bg-slate-200 transition-all flex items-center gap-2 whitespace-nowrap"><i data-lucide="upload" class="w-4 h-4"></i> Importar</button>
+                                    <button onclick="window.exportInventory()" class="bg-green-100 text-green-700 px-5 py-3 rounded-2xl font-black hover:bg-green-200 transition-all flex items-center gap-2 whitespace-nowrap"><i data-lucide="download" class="w-4 h-4"></i> Exportar</button>
+                                    <button onclick="window.openModal()" class="bg-indigo-600 text-white px-7 py-3 rounded-2xl font-black hover:bg-indigo-700 shadow-xl transition-all whitespace-nowrap"><i data-lucide="plus" class="w-4 h-4 inline mr-1"></i>Nuevo</button>
+                                </div>
+                            </div>
+                            <div class="bg-white rounded-[3rem] border border-slate-200 shadow-sm overflow-hidden overflow-x-auto">
+                                <table class="w-full text-left">
+                                    <thead class="text-slate-400 font-black border-b border-slate-100 bg-white text-[10px] uppercase tracking-widest">
+                                        <tr><th class="px-10 py-7">Insumo</th><th class="px-10 py-7">Existencia</th><th class="px-10 py-7 text-center">Estatus</th><th class="px-10 py-7 text-right">Acciones</th></tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-slate-50">
+                                        ${state.inventory.map(item => `
+                                            <tr class="hover:bg-slate-50/70 transition-colors group">
+                                                <td class="px-10 py-7">
+                                                    <p class="font-black text-slate-800 text-lg leading-tight group-hover:text-blue-600 transition-colors">${item.name}</p>
+                                                    <p class="text-[10px] text-slate-400 font-bold uppercase tracking-wider">${item.category}</p>
+                                                </td>
+                                                <td class="px-10 py-7">
+                                                    <span class="font-mono font-black text-2xl ${item.stock <= (item.minStock || 0) ? 'text-red-500' : 'text-slate-900'}">${item.stock}</span>
+                                                    <span class="text-slate-400 text-xs font-bold"> / ${item.minStock || 0} ${item.unit}</span>
+                                                </td>
+                                                <td class="px-10 py-7 text-center">
+                                                    <span class="px-3 py-1 rounded-full text-[10px] font-black uppercase ${item.stock <= (item.minStock || 0) ? 'bg-red-100 text-red-700 animate-pulse' : 'bg-green-100 text-green-700'}">
+                                                        ${item.stock <= (item.minStock || 0) ? 'Reposición' : 'OK'}
+                                                    </span>
+                                                </td>
+                                                <td class="px-10 py-7 text-right">
+                                                    <div class="flex justify-end gap-2">
+                                                        <button onclick='window.handleEditBtn("${item.id}")' class="p-4 text-indigo-600 hover:bg-indigo-50 rounded-2xl border border-slate-100 transition-all shadow-sm bg-white"><i data-lucide="edit-3" class="w-5 h-5"></i></button>
+                                                        <button onclick="window.handleDeleteProduct('${item.id}')" class="p-4 text-red-300 hover:text-red-500 hover:bg-red-50 rounded-2xl border border-slate-100 transition-all shadow-sm bg-white"><i data-lucide="trash-2" class="w-5 h-5"></i></button>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    ` : state.adminTab === 'requests' ? `
+                         <div class="space-y-6">
+                            <div class="flex justify-between items-center px-4 mb-4">
+                                <h2 class="text-2xl font-black flex items-center gap-3 tracking-tighter text-orange-500"><i data-lucide="truck"></i> Cola de Despacho</h2>
+                                <button onclick="window.exportRequests()" class="bg-green-100 text-green-700 px-5 py-3 rounded-2xl font-black hover:bg-green-200 transition-all flex items-center gap-2 text-sm"><i data-lucide="download" class="w-4 h-4"></i> Exportar Historial</button>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                                ${state.requests.map(req => {
+                                    let borderClass = 'border-slate-200 border-l-[16px] border-l-orange-400';
+                                    let badgeClass = 'bg-orange-100 text-orange-700';
+                                    
+                                    if (req.status === 'Entregado') { borderClass = 'border-green-100'; badgeClass = 'bg-green-100 text-green-700'; } 
+                                    else if (req.status === 'Devolución Parcial') { borderClass = 'border-blue-100'; badgeClass = 'bg-blue-50 text-blue-600'; } 
+                                    else if (req.status === 'Devuelto') { borderClass = 'border-blue-100 opacity-60'; badgeClass = 'bg-blue-100 text-blue-700'; }
+                                    
+                                    return `
+                                    <div class="bg-white p-8 rounded-[3rem] border shadow-sm transition-all relative ${borderClass}">
+                                        <div class="flex justify-between items-start mb-8">
+                                            <div><h4 class="font-black text-slate-800 text-xl leading-tight">${req.employee}</h4><p class="text-[10px] text-slate-400 font-black uppercase mt-3 tracking-widest">${req.department}</p></div>
+                                            <span class="text-[9px] font-black px-4 py-2 rounded-full uppercase tracking-widest ${badgeClass} text-center">${req.status}</span>
+                                        </div>
+                                        <div class="bg-slate-50 p-6 rounded-[2rem] mb-6 space-y-3 border border-slate-100 shadow-inner">
+                                            ${req.items.map(i => `
+                                                <div class="flex justify-between items-center text-sm font-bold border-b border-white pb-2 last:border-0">
+                                                    <span class="text-slate-600">${i.name}</span>
+                                                    <div class="text-right">
+                                                        <span class="bg-white px-2 rounded-lg text-xs font-black text-slate-700">x${i.quantity}</span>
+                                                        ${(i.returned > 0) ? `<span class="bg-blue-100 text-blue-700 px-2 rounded-lg text-[10px] font-black ml-1">Dev: ${i.returned}</span>` : ''}
+                                                    </div>
+                                                </div>
+                                            `).join('')}
+                                        </div>
+                                        <div class="flex items-center justify-between mt-4">
+                                            <span class="text-[9px] text-slate-300 font-black uppercase tracking-tighter">${req.date}</span>
+                                            <div class="flex gap-2">
+                                                ${req.status === 'Pendiente' ? `<button onclick="window.updateRequestStatus('${req.id}', 'Entregado')" class="bg-green-600 text-white px-6 py-2 rounded-2xl font-black text-[10px] shadow-lg hover:bg-green-700 transition-all active:scale-95"><i data-lucide="check-circle" class="w-3.5 h-3.5 inline mr-1"></i> Despachar</button>` : ''}
+                                                ${['Entregado', 'Devolución Parcial'].includes(req.status) ? `<button onclick="window.openReturnModal('${req.id}')" class="bg-blue-600 text-white px-6 py-2 rounded-2xl font-black text-[10px] shadow-lg hover:bg-blue-700 transition-all active:scale-95"><i data-lucide="rotate-ccw" class="w-3.5 h-3.5 inline mr-1"></i> Devolver</button>` : ''}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        </div>
+                    ` : `
+                        <div class="space-y-6">
+                             <div class="flex items-center justify-between px-4">
+                                <h2 class="text-2xl font-black tracking-tighter text-slate-800"><i data-lucide="bar-chart-3" class="text-indigo-500 inline mr-2"></i>Métricas de Consumo</h2>
+                                <div class="flex bg-slate-200 p-1 rounded-2xl shadow-inner">
+                                    <button onclick="window.setAnalyticsMode('stock')" class="px-4 py-1.5 rounded-xl text-[10px] font-black uppercase transition-all ${state.analyticsMode === 'stock' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'}">Stock</button>
+                                    <button onclick="window.setAnalyticsMode('department')" class="px-4 py-1.5 rounded-xl text-[10px] font-black uppercase transition-all ${state.analyticsMode === 'department' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'}">Depto</button>
+                                </div>
+                             </div>
+                             <div class="bg-white p-10 rounded-[3rem] border border-slate-200 shadow-sm h-[500px]">
+                                <canvas id="stockChartCanvas"></canvas>
+                             </div>
+                        </div>
+                    `}
+                </div>
+            `;
+        };
+
+        const startApp = async () => {
+            render();
+            try {
+                const appInstance = initializeApp(firebaseConfig);
+                auth = getAuth(appInstance);
+                db = getFirestore(appInstance);
+                await signInAnonymously(auth);
+                
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        state.user = user;
+                        if (user.email) state.isAdminAuthenticated = true;
+                        if (!state.listenersActive) {
+                            state.listenersActive = true;
+                            initFirebaseListeners();
+                        }
+                    }
+                });
+            } catch (error) { console.error(error); }
+        };
+
+        const initFirebaseListeners = () => {
+            const ticketsCol = collection(db, 'artifacts', appId, 'public', 'data', 'tickets');
+            onSnapshot(ticketsCol, (snap) => {
+                const allDocs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                state.inventory = allDocs.filter(d => d.docType === 'inventory');
+                state.requests = allDocs.filter(d => d.docType === 'request').sort((a,b) => b.timestamp - a.timestamp);
+                state.isLoading = false; render();
+            }, () => { state.isLoading = false; render(); });
+        };
+
+        window.state = state;
+        window.addToCart = addToCart;
+        window.updateCartQuantity = updateCartQuantity;
+        window.submitRequest = submitRequest;
+        window.handleSaveProduct = handleSaveProduct;
+        window.handleDeleteProduct = async (id) => { try { await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tickets', id)); notify("Eliminado"); } catch (e) { notify("Error", "error"); } };
+        
+        window.updateRequestStatus = async (id, status) => { 
+            try { 
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tickets', id), { status }); 
+                notify(`Estado actualizado a: ${status}`); 
+            } catch (e) { notify("Error al actualizar estado", "error"); } 
+        };
+
+        // --- LÓGICA DE DEVOLUCIÓN PARCIAL ---
+        window.openReturnModal = (id) => {
+            const req = state.requests.find(r => r.id === id);
+            if (!req) return;
+            state.returningRequest = req;
+            
+            const container = document.getElementById('returnItemsContainer');
+            let html = '';
+            
+            req.items.forEach((item, index) => {
+                const returnedSoFar = item.returned || 0;
+                const max = item.quantity - returnedSoFar;
+                if (max > 0) {
+                    html += `
+                        <div class="flex justify-between items-center bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
+                            <div>
+                                <p class="font-bold text-slate-800">${item.name}</p>
+                                <p class="text-[10px] text-slate-400 font-black uppercase">Max para devolver: ${max}</p>
+                            </div>
+                            <input type="number" min="0" max="${max}" value="0" name="return_${index}" class="w-20 p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-100 font-black text-center text-blue-600" />
+                        </div>
+                    `;
+                }
+            });
+            
+            container.innerHTML = html;
+            document.getElementById('returnModal').classList.remove('hidden');
+        };
+
+        window.closeReturnModal = () => document.getElementById('returnModal').classList.add('hidden');
+
+        window.handleReturnSubmit = async (e) => {
+            e.preventDefault();
+            const req = state.returningRequest;
+            if (!req) return;
+            const form = e.target;
+            
+            let itemsToReturn = [];
+            let updatedItems = [...req.items];
+            let allFullyReturned = true;
+
+            req.items.forEach((item, index) => {
+                const returnedSoFar = item.returned || 0;
+                const max = item.quantity - returnedSoFar;
+                let inputVal = 0;
+                
+                if (max > 0) {
+                    const input = form.elements[`return_${index}`];
+                    inputVal = parseInt(input.value) || 0;
+                    inputVal = Math.max(0, Math.min(inputVal, max)); // Evitar que metan números raros
+                }
+                
+                if (inputVal > 0) itemsToReturn.push({ id: item.id, qty: inputVal });
+
+                const newTotalReturned = returnedSoFar + inputVal;
+                updatedItems[index].returned = newTotalReturned;
+
+                if (newTotalReturned < item.quantity) {
+                    allFullyReturned = false;
+                }
+            });
+
+            if (itemsToReturn.length === 0) return notify("Ingresa al menos 1 artículo para devolver", "error");
+
+            try {
+                // 1. Devolver el stock a la base de datos de inventario
+                for (const rItem of itemsToReturn) {
+                    const invItem = state.inventory.find(i => i.id === rItem.id);
+                    if (invItem) {
+                        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tickets', rItem.id), { 
+                            stock: invItem.stock + rItem.qty 
+                        });
+                    }
+                }
+
+                // 2. Actualizar el ticket
+                const newStatus = allFullyReturned ? 'Devuelto' : 'Devolución Parcial';
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tickets', req.id), { 
+                    items: updatedItems,
+                    status: newStatus 
+                });
+
+                closeReturnModal();
+                notify("Devolución procesada con éxito");
+            } catch (err) {
+                console.error(err); notify("Error procesando devolución", "error");
+            }
+        };
+
+        window.openModal = (p) => {
+            state.editingProduct = p; const form = document.getElementById('productForm');
+            form.name.value = p?.name || ''; form.category.value = p?.category || ''; form.stock.value = p?.stock || ''; form.minStock.value = p?.minStock || '5'; form.unit.value = p?.unit || 'uds';
+            document.getElementById('modalTitle').textContent = p ? 'Editar' : 'Nuevo'; document.getElementById('modal').classList.remove('hidden');
+        };
+        window.closeModal = () => document.getElementById('modal').classList.add('hidden');
+        window.setAdminTab = (tab) => { state.adminTab = tab; render(); };
+        window.setAnalyticsMode = (mode) => { state.analyticsMode = mode; render(); };
+        window.setSearchQuery = (query) => { state.searchQuery = query.toLowerCase(); render(); };
+        window.setSelectedCategory = (cat) => { state.selectedCategory = cat; render(); };
+        
+        window.handleAdminLogout = async () => { 
+            try { await signOut(auth); state.isAdminAuthenticated = false; state.view = 'employee'; await signInAnonymously(auth); notify("Sesión cerrada"); } catch(e) { notify("Error", "error"); }
+        };
+
+        window.handleAdminLogin = async (e) => {
+            e.preventDefault();
+            const email = document.getElementById('adminEmail').value; const pwd = document.getElementById('adminPwd').value;
+            const btn = document.getElementById('adminLoginBtn'); const originalText = btn.innerHTML;
+            btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-6 h-6"></i> Conectando...'; btn.disabled = true; lucide.createIcons();
+            try {
+                await signInWithEmailAndPassword(auth, email, pwd);
+                state.isAdminAuthenticated = true; notify("¡Bienvenido al Panel de Control!"); render();
+            } catch(error) { notify("Correo o contraseña incorrectos", "error"); btn.innerHTML = originalText; btn.disabled = false; lucide.createIcons(); }
+        };
+
+        window.setView = (v) => { state.view = v; render(); };
+        window.handleEditBtn = (id) => window.openModal(state.inventory.find(i => i.id === id));
+
+        window.exportInventory = () => {
+            const data = state.inventory.map(i => ({ Insumo: i.name, Categoria: i.category, Existencia: i.stock, Minimo: i.minStock, Unidad: i.unit }));
+            if(data.length === 0) return notify("No hay inventario para exportar", "error");
+            const ws = XLSX.utils.json_to_sheet(data); const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, "Inventario");
+            XLSX.writeFile(wb, `Inventario_LorHels_${new Date().toISOString().split('T')[0]}.xlsx`);
+            notify("Inventario descargado con éxito");
+        };
+
+        // Exportar a Excel (Ahora incluye detalles de devoluciones)
+        window.exportRequests = () => {
+            const data = state.requests.map(r => {
+                const articulosDetalle = r.items.map(i => {
+                    const ret = i.returned ? `, devuelto: ${i.returned}` : '';
+                    return `${i.name} (x${i.quantity}${ret})`;
+                }).join(' | ');
+
+                return { 
+                    Fecha: r.date, 
+                    Solicitante: r.employee, 
+                    Departamento: r.department, 
+                    Estatus: r.status, 
+                    Articulos: articulosDetalle 
+                };
+            });
+            if(data.length === 0) return notify("No hay solicitudes para exportar", "error");
+            const ws = XLSX.utils.json_to_sheet(data); const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, "Solicitudes");
+            XLSX.writeFile(wb, `Historial_Solicitudes_${new Date().toISOString().split('T')[0]}.xlsx`);
+            notify("Historial descargado con éxito");
+        };
+
+        window.triggerImport = () => document.getElementById('excelUpload').click();
+        window.handleImportExcel = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            
+            reader.onload = async (evt) => {
+                try {
+                    const data = new Uint8Array(evt.target.result);
+                    const workbook = XLSX.read(data, { type: 'array' });
+                    const sheetName = workbook.SheetNames[0];
+                    const json = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
+                    
+                    if(json.length === 0) return notify("El archivo Excel está vacío", "error");
+                    notify("Procesando importación...", "success");
+                    
+                    const ticketsCol = collection(db, 'artifacts', appId, 'public', 'data', 'tickets');
+                    let actualizados = 0; let creados = 0;
+
+                    for (const row of json) {
+                        const name = row.Insumo || row.name || row.Nombre;
+                        if (!name) continue;
+
+                        const productData = {
+                            docType: 'inventory',
+                            name: String(name),
+                            category: String(row.Categoria || row.category || 'General'),
+                            stock: parseInt(row.Existencia || row.stock || 0),
+                            minStock: parseInt(row.Minimo || row.minStock || 5),
+                            unit: String(row.Unidad || row.unit || 'uds')
+                        };
+
+                        const existing = state.inventory.find(i => i.name.toLowerCase() === productData.name.toLowerCase());
+                        if (existing) {
+                            await setDoc(doc(ticketsCol, existing.id), productData, { merge: true });
+                            actualizados++;
+                        } else {
+                            await addDoc(ticketsCol, productData);
+                            creados++;
+                        }
+                    }
+                    notify(`¡Importación lista! ${creados} creados, ${actualizados} actualizados.`);
+                } catch (err) {
+                    console.error(err); notify("Error al leer el archivo Excel", "error");
+                } finally { e.target.value = ''; }
+            };
+            reader.readAsArrayBuffer(file);
+        };
+
+        startApp();
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+        body { font-family: 'Inter', sans-serif; -webkit-tap-highlight-color: transparent; }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        .animate-in { animation: fadeIn 0.3s ease-out forwards; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900 pb-20">
+
+    <nav class="bg-white border-b border-slate-200 sticky top-0 z-40">
+        <div class="max-w-6xl mx-auto px-4 h-16 flex justify-between items-center">
+            <div class="flex items-center gap-2 cursor-pointer" onclick="window.setView('employee')">
+                <div class="bg-blue-600 p-2 rounded-xl shadow-lg shadow-blue-100">
+                    <i data-lucide="package" class="text-white w-5 h-5"></i>
+                </div>
+                <span class="font-black text-xl text-slate-800 tracking-tight tracking-tighter">LorHels <span class="text-blue-600 tracking-tight">Office</span></span>
+            </div>
+            <div class="flex bg-slate-100 p-1 rounded-2xl border border-slate-200 shadow-inner">
+                <button id="nav-btn-emp" onclick="window.setView('employee')" class="px-6 py-2 rounded-xl text-xs font-black uppercase tracking-widest transition-all bg-white shadow-sm text-blue-600">Empleado</button>
+                <button id="nav-btn-adm" onclick="window.setView('admin')" class="px-6 py-2 rounded-xl text-xs font-black uppercase tracking-widest transition-all text-slate-400">Admin</button>
+            </div>
+        </div>
+    </nav>
+
+    <main id="app-content" class="max-w-6xl mx-auto px-4 py-8 min-h-[60vh]">
+        </main>
+
+    <div id="modal" class="hidden fixed inset-0 bg-slate-900/80 backdrop-blur-xl z-50 flex items-center justify-center p-4">
+        <div class="bg-white w-full max-w-md rounded-[3.5rem] shadow-2xl animate-in">
+            <form id="productForm" onsubmit="window.handleSaveProduct(event)" class="p-10 space-y-8">
+                <div class="flex justify-between items-center">
+                    <h2 id="modalTitle" class="text-3xl font-black text-slate-800 tracking-tighter">Insumo</h2>
+                    <button type="button" onclick="window.closeModal()" class="text-slate-300 hover:text-slate-900 transition-colors p-3 bg-slate-50 rounded-2xl"><i data-lucide="x" class="w-8 h-8"></i></button>
+                </div>
+                <div class="space-y-6">
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-black uppercase text-slate-400 ml-3 tracking-widest">Nombre</label>
+                        <input name="name" required class="w-full p-5 bg-slate-50 border border-slate-200 rounded-3xl outline-none focus:ring-4 focus:ring-indigo-50 font-bold" />
+                    </div>
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-black uppercase text-slate-400 ml-3 tracking-widest">Categoría</label>
+                        <input name="category" required class="w-full p-5 bg-slate-50 border border-slate-200 rounded-3xl outline-none focus:ring-4 focus:ring-indigo-50 font-bold" />
+                    </div>
+                    <div class="flex gap-4">
+                        <div class="flex-1 space-y-1">
+                            <label class="text-[10px] font-black uppercase text-slate-400 ml-3 tracking-widest">Existencia</label>
+                            <input name="stock" type="number" required class="w-full p-5 bg-slate-50 border border-slate-200 rounded-3xl outline-none focus:ring-4 focus:ring-indigo-50 font-black text-center" />
+                        </div>
+                        <div class="flex-1 space-y-1">
+                            <label class="text-[10px] font-black uppercase text-slate-400 ml-3 tracking-widest text-red-500">Mínimo</label>
+                            <input name="minStock" type="number" required class="w-full p-5 bg-red-50 border border-red-200 rounded-3xl outline-none focus:ring-4 focus:ring-red-100 font-black text-center text-red-600" />
+                        </div>
+                    </div>
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-black uppercase text-slate-400 ml-3 tracking-widest">Unidad</label>
+                        <input name="unit" required placeholder="uds, cajas, etc" class="w-full p-5 bg-slate-50 border border-slate-200 rounded-3xl outline-none focus:ring-4 focus:ring-indigo-50 font-bold" />
+                    </div>
+                </div>
+                <button type="submit" class="w-full bg-indigo-600 text-white py-6 rounded-[2.5rem] font-black hover:bg-indigo-700 shadow-2xl text-xl transition-all">Sincronizar</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="returnModal" class="hidden fixed inset-0 bg-slate-900/80 backdrop-blur-xl z-50 flex items-center justify-center p-4">
+        <div class="bg-white w-full max-w-md rounded-[3.5rem] shadow-2xl animate-in flex flex-col max-h-[90vh]">
+            <form id="returnForm" onsubmit="window.handleReturnSubmit(event)" class="p-10 space-y-6 flex flex-col h-full">
+                <div class="flex justify-between items-center shrink-0">
+                    <h2 class="text-3xl font-black text-slate-800 tracking-tighter">Devolución</h2>
+                    <button type="button" onclick="window.closeReturnModal()" class="text-slate-300 hover:text-slate-900 transition-colors p-3 bg-slate-50 rounded-2xl"><i data-lucide="x" class="w-8 h-8"></i></button>
+                </div>
+                <p class="text-xs text-slate-400 font-bold uppercase tracking-widest shrink-0">Especifica la cantidad a devolver</p>
+                
+                <div id="returnItemsContainer" class="space-y-3 overflow-y-auto pr-2 custom-scrollbar flex-1 min-h-[100px]">
+                    </div>
+                
+                <button type="submit" class="w-full shrink-0 mt-4 bg-blue-600 text-white py-5 rounded-[2.5rem] font-black hover:bg-blue-700 shadow-2xl text-lg transition-all flex justify-center items-center gap-2">Confirmar</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="notification" class="hidden animate-in"></div>
+
+</body>
+</html>
